@@ -6,5 +6,5 @@
 - **cart_pole_task.ipynb** — изучение метода обучения с подкреплением на примере задачи CartPole.
 - **fine_tuning.ipynb** — дообучение ResNet18 на CIFAR-10.
 - **fine_tuning_with_transform.ipynb** — дообучение ResNet18 на CIFAR-10 с трансформацией данных.
-
+- **a2c_ppo** - папка с реализацией обучения сверточной модели с помощью RL-агента
 
