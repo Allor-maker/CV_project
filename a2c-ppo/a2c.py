@@ -16,7 +16,8 @@ from sklearn.metrics import confusion_matrix
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
 NUM_CLASSES = 10
-IMG_SIZE = 32  
+IMG_SIZE = 128  
+NUM_IMAGES = 1000
 
 
 class DataSet():
@@ -94,7 +95,7 @@ def get_dataloader(subset):
 
 class Flatten(nn.Module):
     def forward(self, batch):
-        return batch.view(batch.size(0), -1)
+        return batch.reshape(batch.size(0), -1)
     
 class SimpleCNN(nn.Module):
     def __init__(self, num_classes=10):
@@ -103,14 +104,23 @@ class SimpleCNN(nn.Module):
         self.cv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
         self.flatten = Flatten()
-        self.fc1 = nn.Linear(64 * IMG_SIZE * IMG_SIZE, 128)
+        self.fc1 = nn.Linear(64 * (IMG_SIZE//4) * (IMG_SIZE//4), 128)
         self.fc2 = nn.Linear(128, num_classes)
         self.relu = nn.ReLU()
         
     def forward(self, x):
+        x = x.permute(0, 3, 1, 2).float()  # Изменяем порядок осей
         x = F.relu(self.cv1(x))
+        x = self.pool(x)  # применяем пулинг после первой свертки
+        #print(f"После первого пулинга: {x.shape}")
         x = F.relu(self.cv2(x))
+        x = self.pool(x)  # применяем пулинг после второй свертки
+        #print(f"После второго пулинга: {x.shape}")
+        #print(f"Размер тензора после свертки: {x.shape}")
         x = self.flatten(x)
+        #print(f"Размер тензора после flatten: {x.shape}")
+        x = x.view(x.size(0), -1)  # или reshape
+        #print(f"Размер тензора перед линейным слоем: {x.shape}")
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -128,19 +138,19 @@ class BloodCellDataset(Dataset):
     def __getitem__(self, idx):
         image = self.images[idx]
         label = self.labels[idx]
-        image = np.expand_dims(image, axis=0)  # Добавляем канал (1, H, W)
+        #image = np.expand_dims(image, axis=0)  # Добавляем канал (1, H, W)
 
         if self.transform:
             image = self.transform(image)
 
-        return torch.tensor(image, dtype=torch.float32), torch.tensor(label, dtype=torch.long)
-
+        return torch.tensor(image, dtype=torch.int32), torch.tensor(label, dtype=torch.long)
+    
 class DataPreloading():
-    def __init__(self, num_samples=100):
+    def __init__(self, num_samples=NUM_IMAGES):
         self.dataset_generator = DataSet()
         images, labels = self.dataset_generator.generate_dataset(num_samples)
-        self.dataset = BloodCellDataset(images, labels)
 
+        self.dataset = BloodCellDataset(images, labels)
     def get_train_data(self):
         return self.dataset
     
@@ -148,10 +158,8 @@ class DataSelectionEnv(gymnasium.Env):
     def __init__(self):
         super(DataSelectionEnv, self).__init__()
         self.train_data = DataPreloading().get_train_data()
-        self.num_class = NUM_CLASSES
         self.model = SimpleCNN()
         self.criterion = nn.CrossEntropyLoss()
-        self.total_num_img = 32
         self.indexes = self.class_select()
         self.optim = optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
         
@@ -160,10 +168,11 @@ class DataSelectionEnv(gymnasium.Env):
         self.observation_space = gymnasium.spaces.Box(low=0, high=1, shape=(NUM_CLASSES,), dtype=np.float32)
     
     def class_select(self):#возвращаем словарь из индексов принадлежащим классам
-        ls = {i: [] for i in range(self.num_class)} #создали пустой словарь на 10 классов
+        ls = {i: [] for i in range(1,NUM_CLASSES+1)} #создали пустой словарь на 10 классов
 
         for x, (_, label) in enumerate(self.train_data):
-            ls[label].append(x) #индекс каждого изображения из train_data положили в нужный класс в зависимости от метки
+            label_value = label.item()
+            ls[label_value].append(x) #индекс каждого изображения из train_data положили в нужный класс в зависимости от метки
 
         return ls
     
@@ -171,60 +180,84 @@ class DataSelectionEnv(gymnasium.Env):
         action = F.softmax(torch.tensor(action), dim=-1).numpy()
         index = []
 
-        for i in range(self.num_class):
-            num_img = int(action[i] * self.total_num_img) #определили количество изображений для i-го класса в выборке из 32 изображений
-            indexes = np.random.choice(self.indexes[i], num_img, replace=True) #рандомно выбираем вычисленное количество изображений из изображений нужного класса, возвращаем их индексы
+        for i in range(NUM_CLASSES):
+            num_img = int(action[i] * NUM_IMAGES) #определили количество изображений для i-го класса в выборке из batch_size изображений
+            indexes = np.random.choice(self.indexes[i+1], num_img, replace=True) #рандомно выбираем вычисленное количество изображений из изображений нужного класса, возвращаем их индексы
             index.extend(indexes)#добавляем найденные индексы в выборку
 
         return Subset(self.train_data, index)#состовляем subset 
     
     def step(self, action):
         # в этой функции мы создаем выборку на основе action и проверяем, насколько улучшилось или ухудшилось предсказание сети
+        action = np.clip(action + np.random.uniform(-0.05, 0.05, size=action.shape), 0, 1)
         train_subset = self.sample(action) #subset - выбранное случайное подмножество из 32 элементов на основе распределения action
         test_subset = self.sample(action) #subset - выбранное случайное подмножество из 32 элементов на основе распределения action
 
         train_dataloader = get_dataloader(train_subset) #создали dataloader, выдающий этот batch из 32 элементов 
         test_dataloader = get_dataloader(test_subset) #создаем dataloader для тестирования
 
-        prev_acc, _ = self.evaluate(test_dataloader) #вычиляем текущую точность модели на тестовой выборке
+        #prev_acc, _ = self.evaluate(test_dataloader) #вычиляем текущую точность модели на тестовой выборке
         self.train_model(train_dataloader) #тренируем модель на тренировчной выборке
         new_acc, err_per_cl = self.evaluate(test_dataloader) #проверяем модель после тренировки на тестовой выборке
 
-        reward = new_acc - prev_acc #вычисляем награду
-
+        reward = new_acc #вычисляем награду
+        for i in range(NUM_CLASSES):
+            if err_per_cl[i]==1:
+                reward-=30
+            if err_per_cl[i]<1 and err_per_cl[i]>=0.9:
+                reward+=5
+            elif err_per_cl[i]<0.9 and err_per_cl[i]>=0.8:
+                reward+=10
+            elif err_per_cl[i]<0.8 and err_per_cl[i]>=0.7:
+                reward+=15
+            elif err_per_cl[i]<0.7 and err_per_cl[i]>=0.6:
+                reward+=20
+            elif err_per_cl[i]<0.6 and err_per_cl[i]>=0.5:
+                reward+=25
+            elif err_per_cl[i]<0.5:
+                reward+=50
+            
+        #reward = new_acc
         return reward, err_per_cl
     
     def train_model(self, dataloader):
         # на вход приходит dataloader выдающий batch изображений и ответов к ним
-        batch = iter(dataloader) #получили батч из тренирогочного dataloader 
-        images, labels = batch #разделили полученный батч на изображения и метки
+        batchiter = iter(dataloader) #получили батч из тренирогочного dataloader 
+        for i,batch in enumerate(batchiter):
 
-        self.optim.zero_grad() #обновили optimizer
-        output = self.model(images) #получили тензор(batch_size, NUM_CLASSES) с распределением вероятностей для каждого изображения
-        loss = self.criterion(output, labels) #вычислили ошибку с помощью CrossEntropyLoss
-
-        loss.backward()
-        self.optim.step()
+            images, labels = batch #разделили полученный батч на изображения и метки
+            self.optim.zero_grad() #обновили optimizer
+            output = self.model(images) #получили тензор(batch_size, NUM_CLASSES) с распределением вероятностей для каждого изображения
+            #print(output)
+            loss = self.criterion(output, labels-1) #вычислили ошибку с помощью CrossEntropyLoss
+            loss.backward()
+            self.optim.step()
     
     def evaluate(self,dataloader):#тестирование модели
         self.model.eval()#перевели модель в оценочный режим
         correct = 0
         total = 0
-        all_labels = []
-        all_preds = []
+        ls = [0]*10
+        ers = [0]*10
         with torch.no_grad():
-            batch = iter(dataloader) #получили из dataloader batch на batch_size изображений
-            images,labels = batch # получили изображения и ответы
-            all_labels.extend(labels)
-            output = self.model(images) #получили тензор(batch_size,NUM_CLASSES) с распределениями вероятснотей для каждого изображения
-            predicted = torch.argmax(output,dim=1) #получили тезор(batch_size) с предложенными значениями классов
-            all_preds.extend(predicted)
-            correct += (predicted==labels).sum().item() #нашли количество правильных ответов
-            total = BATCH_SIZE #так как мы рассматриваем только один батч, следовательно общий разве - BATCH_SIZE
+            batchiter = iter(dataloader) #получили из dataloader batch на batch_size изображений
+            for i,batch in enumerate(batchiter):
+                images,labels = batch # получили изображения и ответы
+                output = self.model(images) #получили тензор(batch_size,NUM_CLASSES) с распределениями вероятснотей для каждого изображения
+                predicted = torch.argmax(output,dim=1) #получили тезор(batch_size) с предложенными значениями классов
+                correct += (predicted==labels).sum().item() #нашли количество правильных ответов
+                total += 1 #так как мы рассматриваем только один батч, следовательно общий размер - BATCH_SIZE
 
-        conf_matrix = confusion_matrix(all_labels,all_preds)#находим confusion matrix,чтобы рассчитать ошибку по классам
-        error_per_class = conf_matrix.sum(axis=1) - np.diagonal(conf_matrix)#рассчитываем ошибку по классам, возваращаем ...
-        accuracy = correct / total if total > 0 else 0 # находим точность на данной выборке
+                for i in range(len(labels)):
+                    if predicted[i]==labels[i]:
+                        ls[labels[i]-1]+=1  
+                    else:
+                        ers[labels[i]-1]+=1
+                        ls[labels[i]-1]+=1
+            print(ers,ls)
+            error_per_class = [ers[i]/ls[i] for i in range(NUM_CLASSES)]
+
+        accuracy = (correct / total) if total > 0 else 0 # находим точность на данной выборке
         return accuracy, error_per_class
 
 class Actor(nn.Module):
@@ -251,17 +284,25 @@ class Critic(nn.Module):
 def actor_critic(env, actor, critic, episodes=100, max_steps=100, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3):
     optimizer_actor = optim.AdamW(actor.parameters(), lr=lr_actor)
     optimizer_critic = optim.AdamW(critic.parameters(), lr=lr_critic)
-    EPS = 0.2 #значение epsilon для клиппинга обычно от 0.1 до 0.3
+    EPS = 0.3 #значение epsilon для клиппинга обычно от 0.1 до 0.3
     state = np.ones(NUM_CLASSES) / 2 # проценты точности на каждом классе
     for episode in range(episodes):
         step = 0
         while step < max_steps:
+            print(step, state)
             step += 1
             state_tensor = torch.FloatTensor(state)#флотовый тензор с процентами точности
-            action_probabilities = actor(state_tensor)#вызов forward для actor от state_tensor, возвращает тензор распределения процентов количества изображений классов в выборке
-            action = action_probabilities.numpy() # ndarray от action_probabilities
-            old_log_prob = torch.log(action_probabilities)
+            epsilon = 0.1  # Вероятность случайного выбора действия
+            if np.random.rand() < epsilon:
+                action = np.random.dirichlet(np.ones_like(state))  # Случайное распределение
+                action_probabilities = torch.FloatTensor(action)  # Создаем фейковый тензор, чтобы избежать ошибки
+            else:
+                with torch.no_grad():  
+                    action_probabilities = actor(state_tensor)  
+                    action = action_probabilities.detach().numpy()
 
+            old_log_prob = torch.log(action_probabilities)
+            print(action)
             reward, next_state = env.step(action) #рассчитываем награду и next_state, где next_state - ndarray процента ошибок по классам на тестовой выборке из batch_size элементов
             next_state_tensor = torch.FloatTensor(next_state)#создаем тензор от next_state
             new_action_probabilities = actor(next_state_tensor)
@@ -270,17 +311,18 @@ def actor_critic(env, actor, critic, episodes=100, max_steps=100, gamma=0.99, lr
             value = critic(state_tensor) #критик предсказывает значение на основе предыдущего тензора 
             next_value = critic(next_state_tensor) #и предсказывает значение на основе нового тензора
             
-            advantage = reward + (gamma * next_value.item()) - value.item()
-            loss_critic = advantage ** 2
+            advantage = reward + (gamma * next_value) - value
+            print(advantage)
+            loss_critic = advantage.pow(2).mean()
 
             #вычисляем потерю актера с учетом клиппинга
             ratio = torch.exp(new_log_prob - old_log_prob)
             surrogate_loss = torch.min(ratio * advantage, torch.clamp(ratio, 1 - EPS, 1 + EPS) * advantage)
-            loss_actor = -surrogate_loss.mean()
-
-            optimizer_critic.zero_grad()
-            loss_critic.backward()
-            optimizer_critic.step()
+            entropy_bonus = -torch.sum(action_probabilities * torch.log(action_probabilities + 1e-6))  # Энтропия
+            
+            loss_actor = surrogate_loss.mean()
+            loss_actor += 0.01 * entropy_bonus  # Добавляем в функцию потерь
+            
             state = next_state
 
             #вводим фиктивную раномерно распределенную выборку для более объективной оценки точности
@@ -290,8 +332,12 @@ def actor_critic(env, actor, critic, episodes=100, max_steps=100, gamma=0.99, lr
                 test_action = test_action_probabilities.numpy()
                 _,state = env.step(test_action)
             #обновляем политику раз в 10 шагов
-            if step % 10 == 0:
+            if step % 10 != 0:
                 optimizer_actor.zero_grad()
                 loss_actor.backward()
                 optimizer_actor.step()
+            else:
+                optimizer_critic.zero_grad()
+                loss_critic.backward(retain_graph=True)
+                optimizer_critic.step()
     return
