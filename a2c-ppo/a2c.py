@@ -8,12 +8,89 @@ from torchvision import datasets, transforms
 from torch.utils.data import DataLoader, Subset
 from torch.distributions import Categorical
 import gymnasium
+import cv2
+from PIL import Image, ImageDraw
+import os
 #from tqdm import tqdm
 
 BATCH_SIZE = 32
 LEARNING_RATE = 1e-3
 NUM_CLASSES = 10
 IMG_SIZE = 32  
+
+
+class DataSet():
+    def __init__(self):# 1. Параметры генератора
+        self.CELL_COUNT_RANGE = (0, 10)  # Количество клеток на изображение (минимум, максимум)
+        self.CELL_SIZE_RANGE = (10, 30)  # Диаметр клеток (минимум, максимум)
+        self.CELL_COLOR_RANGE = ((100, 0, 0), (255, 100, 100))  # Цвет клеток (минимум, максимум по BGR)
+        self.BACKGROUND_COLOR = (267, 200, 200)  # Розовый фон
+        self.OVERLAP_PROBABILITY = 0.1  # Вероятность перекрытия клетки с другой
+    
+    def random_color(color_range):
+        """Генерирует случайный цвет в заданном диапазоне."""
+        return tuple(random.randint(color_range[0][i], color_range[1][i]) for i in range(3))
+
+    def generate_blood_cell_image(self):
+        """Генерирует одно изображение с клетками крови."""
+        image = Image.new("RGB", (self.IMAGE_SIZE, self.IMAGE_SIZE), self.BACKGROUND_COLOR)
+        draw = ImageDraw.Draw(image)
+        cell_count = random.randint(self.CELL_COUNT_RANGE[0], self.CELL_COUNT_RANGE[1])
+        cells = []  # Список координат и размеров клеток, чтобы отслеживать перекрытия
+
+        for _ in range(cell_count):
+            cell_size = random.randint(self.CELL_SIZE_RANGE[0], self.CELL_SIZE_RANGE[1])
+
+            # Попробуем найти позицию для клетки, чтобы избежать перекрытия (если OVERLAP_PROBABILITY низкая)
+            max_attempts = 100
+            for attempt in range(max_attempts):
+                x = random.randint(cell_size, IMG_SIZE - cell_size)
+                y = random.randint(cell_size, IMG_SIZE - cell_size)
+
+                # Проверяем, перекрывается ли новая клетка с существующими
+                overlap = False
+                if random.random() > self.OVERLAP_PROBABILITY: # Проверяем, нужно ли вообще проверять перекрытие
+                    for existing_x, existing_y, existing_size in cells:
+                        distance = np.sqrt((x - existing_x)**2 + (y - existing_y)**2)
+                        if distance < (cell_size + existing_size) * 0.7:  # Уменьшил коэфф. для допущения небольшого перекрытия
+                            overlap = True
+                            break
+
+                if not overlap:
+                    break # Нашли подходящую позицию
+
+            if overlap and attempt == max_attempts-1 :
+                #Если не нашли хорошую позицию, то игнорируем данную клетку
+                continue
+
+
+            cell_color = self.random_color(self.CELL_COLOR_RANGE)
+            draw.ellipse((x - cell_size, y - cell_size, x + cell_size, y + cell_size), fill=cell_color)
+            cells.append((x, y, cell_size))
+
+        return np.array(image), cell_count
+
+    def generate_dataset(self,num_images, output_dir="blood_cell_dataset"):
+        """Генерирует набор данных изображений и меток."""
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+
+        images = []
+        labels = []
+
+        for i in range(num_images):
+            image, cell_count = self.generate_blood_cell_image()
+            images.append(image)
+            labels.append(cell_count)
+
+            # Сохранение изображений (опционально)
+            image_path = os.path.join(output_dir, f"image_{i}.png")
+            cv2.imwrite(image_path, cv2.cvtColor(image, cv2.COLOR_RGB2BGR))  # Convert to BGR for OpenCV
+
+        return images, labels
+# 4. Создание набора данных
+NUM_IMAGES = 100
+images, labels = DataSet.generate_dataset(NUM_IMAGES)
 
 def get_dataloader(dataset, indices):
     subset = Subset(dataset, indices)
