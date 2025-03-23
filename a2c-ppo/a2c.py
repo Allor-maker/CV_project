@@ -24,7 +24,7 @@ class DataSet():
         self.CELL_COUNT_RANGE = (1, 10)  # Количество клеток на изображение (минимум, максимум)
         self.CELL_SIZE_RANGE = (5, 15)  # Диаметр клеток (минимум, максимум)
         self.CELL_COLOR_RANGE = ((100, 0, 0), (255, 100, 100))  # Цвет клеток (минимум, максимум по BGR)
-        self.BACKGROUND_COLOR = (267, 200, 200)  # Розовый фон
+        self.BACKGROUND_COLOR = (247, 131, 243)  # Розовый фон
         self.OVERLAP_PROBABILITY = 0.1  # Вероятность перекрытия клетки с другой
     
     def random_color(self, color_range):
@@ -117,7 +117,8 @@ class SimpleCNN(nn.Module):
 
 class BloodCellDataset(Dataset):
     def __init__(self, images, labels, transform=None):
-        self.images = [cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) for img in images]  # Преобразуем в градации серого
+        #self.images = [cv2.cvtColor(img, cv2.COLOR_RGB2GRAY) for img in images]  # Преобразуем в градации серого
+        self.images = images
         self.labels = labels
         self.transform = transform
 
@@ -251,6 +252,7 @@ def actor_critic(env, actor, critic, episodes, max_steps=1000, gamma=0.99, lr_ac
     optimizer_actor = optim.AdamW(actor.parameters(), lr=lr_actor)
     optimizer_critic = optim.AdamW(critic.parameters(), lr=lr_critic)
     EPS = 0.2 #значение epsilon для клиппинга обычно от 0.1 до 0.3
+
     for episode in range(episodes):
         state = np.ones(NUM_CLASSES) / 2 # проценты точности на каждом классе
         step = 0
@@ -273,14 +275,22 @@ def actor_critic(env, actor, critic, episodes, max_steps=1000, gamma=0.99, lr_ac
             loss_critic = advantage ** 2
 
             #вычисляем потерю актера с учетом клиппинга
-            ratio = new_log_prob / old_log_prob
+            ratio = torch.exp(new_log_prob - old_log_prob)
             surrogate_loss = torch.min(ratio * advantage, torch.clamp(ratio, 1 - EPS, 1 + EPS) * advantage)
             loss_actor = -surrogate_loss.mean()
 
             optimizer_critic.zero_grad()
             loss_critic.backward()
             optimizer_critic.step()
-            
+            state = next_state
+
+            #вводим фиктивную раномерно распределенную выборку для более объективной оценки точности
+            if step % 100 == 0:
+                test_state = np.ones(NUM_CLASSES)/NUM_CLASSES
+                test_action_probabilities = torch.FloatTensor(test_state)
+                test_action = test_action_probabilities.numpy()
+                _,state = env.step(test_action)
+            #обновляем политику раз в 10 шагов
             if step % 10 == 0:
                 optimizer_actor.zero_grad()
                 loss_actor.backward()
