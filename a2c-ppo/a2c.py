@@ -248,13 +248,12 @@ class Critic(nn.Module):
         x = F.relu(self.fc1(x))
         return self.fc2(x)
 
-def actor_critic(env, actor, critic, episodes, max_steps=1000, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3):
+def actor_critic(env, actor, critic, episodes=100, max_steps=100, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3):
     optimizer_actor = optim.AdamW(actor.parameters(), lr=lr_actor)
     optimizer_critic = optim.AdamW(critic.parameters(), lr=lr_critic)
     EPS = 0.2 #значение epsilon для клиппинга обычно от 0.1 до 0.3
-
+    state = np.ones(NUM_CLASSES) / 2 # проценты точности на каждом классе
     for episode in range(episodes):
-        state = np.ones(NUM_CLASSES) / 2 # проценты точности на каждом классе
         step = 0
         while step < max_steps:
             step += 1
@@ -285,7 +284,7 @@ def actor_critic(env, actor, critic, episodes, max_steps=1000, gamma=0.99, lr_ac
             state = next_state
 
             #вводим фиктивную раномерно распределенную выборку для более объективной оценки точности
-            if step % 100 == 0:
+            if step == 99:
                 test_state = np.ones(NUM_CLASSES)/NUM_CLASSES
                 test_action_probabilities = torch.FloatTensor(test_state)
                 test_action = test_action_probabilities.numpy()
