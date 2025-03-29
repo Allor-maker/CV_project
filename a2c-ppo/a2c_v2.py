@@ -1,8 +1,11 @@
+import random
+from collections import namedtuple, deque
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
-import random
 import numpy as np
 from torch.utils.data import Dataset
 from torch.utils.data import DataLoader, Subset
@@ -12,18 +15,35 @@ from PIL import Image, ImageDraw
 import os
 from sklearn.metrics import confusion_matrix
 #from tqdm import tqdm
+import copy #Импортируем библиотеку для ранней остановки
 
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
 NUM_CLASSES = 10
 IMG_SIZE = 128
-NUM_IMAGES = 10000
+NUM_IMAGES = 100000
 MAX_SUBSET_SIZE = 200
 CNN_EPOCHS = 2
 REWARD_SMOOTHING_WINDOW = 5
 
+EPS_START = 0.9
+EPS_END = 0.05
+EPS_DECAY = 300
+
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
+class replay_memory(object):
+    def __init__(self,capacity):
+        self.memory = deque([],maxlen=capacity)
+    def push(self,*args):
+        self.memory.append(Transition(*args))
+    def sample(self,batch_size):
+        return random.sample(self.memory,batch_size)
+    def __len__(self):
+        return len(self.memory)
+#we need this class to save the experiance of our agent(for RL - reinfocement learning)
 
 class DataSet():
     def __init__(self):# 1. Параметры генератора
@@ -108,6 +128,7 @@ class SimpleCNN(nn.Module):
         self.cv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
         self.cv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
         self.pool = nn.MaxPool2d(2, 2)
+        self.dropout = nn.Dropout(0.25) # Dropout
         self.flatten = Flatten()
         self.fc1 = nn.Linear(64 * (IMG_SIZE//4) * (IMG_SIZE//4), 128)
         self.fc2 = nn.Linear(128, num_classes)
@@ -115,16 +136,12 @@ class SimpleCNN(nn.Module):
 
     def forward(self, x):
         x = F.relu(self.cv1(x))
-        x = self.pool(x)  # применяем пулинг после первой свертки
-        #print(f"После первого пулинга: {x.shape}")
+        x = self.pool(x)
         x = F.relu(self.cv2(x))
-        x = self.pool(x)  # применяем пулинг после второй свертки
-        #print(f"После второго пулинга: {x.shape}")
-        #print(f"Размер тензора после свертки: {x.shape}")
+        x = self.pool(x)
         x = self.flatten(x)
-        #print(f"Размер тензора после flatten: {x.shape}")
+        x = self.dropout(x)  # Применяем Dropout перед полносвязными слоями
         x = x.view(x.size(0), -1)  # или reshape
-        #print(f"Размер тензора перед линейным слоем: {x.shape}")
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
@@ -166,7 +183,7 @@ class DataSelectionEnv(gymnasium.Env):
         self.model = SimpleCNN().to(DEVICE) #Put the model on the available device
         self.criterion = nn.CrossEntropyLoss()
         self.indexes = self.class_select()
-        self.optim = optim.Adam(self.model.parameters(), lr=LEARNING_RATE)
+        self.optim = optim.Adam(self.model.parameters(), lr=LEARNING_RATE,weight_decay=1e-5) # L2 регуляризация
 
         # Пространство действий: вероятности выбора изображений для каждого класса
         self.action_space = gymnasium.spaces.Box(low=0, high=1, shape=(NUM_CLASSES,), dtype=np.float32)
@@ -178,6 +195,8 @@ class DataSelectionEnv(gymnasium.Env):
         self.validation_dataloader = get_dataloader(self.validation_subset, shuffle=False)
 
         self.reward_history = []  # To store rewards for smoothing
+        self.last_acc = 0 #Для разницы между наградами
+        self.last_per_class = 0
     def class_select(self):#возвращаем словарь из индексов принадлежащим классам
         ls = {i: [] for i in range(NUM_CLASSES)} #создали пустой словарь на 10 классов
 
@@ -209,37 +228,17 @@ class DataSelectionEnv(gymnasium.Env):
         train_dataloader = get_dataloader(train_subset) #создали dataloader, выдающий этот batch из 32 элементов
         #prev_acc, _ = self.evaluate(test_dataloader) #вычиляем текущую точность модели на тестовой выборке
         self.train_model(train_dataloader, epochs=CNN_EPOCHS) #тренируем модель на тренировчной выборке
-        new_acc, err_per_cl = self.evaluate(self.validation_dataloader) #проверяем модель после тренировки на тестовой выборке
+        new_acc, accuracy_per_class = self.evaluate(self.validation_dataloader)  # Теперь возвращается точность по классам
+        class_weights = [1,1,1,1,1,1,1,1,1,1] #Пример
+        reward = np.sum([class_weights[i] * accuracy_per_class[i] for i in range(NUM_CLASSES)])-self.last_per_class
+        self.last_per_class = np.sum([class_weights[i] * accuracy_per_class[i] for i in range(NUM_CLASSES)]) #Вычитаем предыдущие значения
+        #reward = new_acc - self.last_acc #Предыдущая награда
 
-        self.reward_history.append(new_acc)
-        if len(self.reward_history) > REWARD_SMOOTHING_WINDOW:
-            self.reward_history.pop(0)
-        smoothed_reward = np.mean(self.reward_history)
-
-        reward = smoothed_reward
-
-        for i in range(NUM_CLASSES):
-            if err_per_cl[i]==1:
-                reward-=5
-            if err_per_cl[i]<1 and err_per_cl[i]>=0.9:
-                reward+=1
-            elif err_per_cl[i]<0.9 and err_per_cl[i]>=0.8:
-                reward+=2
-            elif err_per_cl[i]<0.8 and err_per_cl[i]>=0.7:
-                reward+=3
-            elif err_per_cl[i]<0.7 and err_per_cl[i]>=0.6:
-                reward+=4
-            elif err_per_cl[i]<0.6 and err_per_cl[i]>=0.5:
-                reward+=5
-            elif err_per_cl[i]<0.5:
-                reward+=10
-
-        #reward = new_acc
-        return reward, err_per_cl
+        return reward, accuracy_per_class
 
     def train_model(self, dataloader, epochs=5): #multiple epochs
         # на вход приходит dataloader выдающий batch изображений и ответов к ним
-        self.model.train()
+        self.model.train()#Необходимо переводить в train
         for epoch in range(epochs):
             for images, labels in dataloader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
@@ -274,10 +273,10 @@ class DataSelectionEnv(gymnasium.Env):
                         ls[label]+=1
             #print(ers,ls)
             error_per_class = [ers[i]/ls[i] if ls[i] > 0 else 0 for i in range(NUM_CLASSES)] #handle the zero division
-
+            accuracy_per_class = [1 - err for err in error_per_class] #Вычисляем точность
         accuracy = (correct / total) if total > 0 else 0 # находим точность на данной выборке
         print("accuracy = ", accuracy)
-        return accuracy, error_per_class
+        return accuracy, accuracy_per_class
 
 class Actor(nn.Module):
     def __init__(self, input_size, num_actions):
@@ -303,71 +302,141 @@ class Critic(nn.Module):
 def actor_critic(env, actor, critic, episodes=10, max_steps=100, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3):
     optimizer_actor = optim.AdamW(actor.parameters(), lr=lr_actor)
     optimizer_critic = optim.AdamW(critic.parameters(), lr=lr_critic)
-    EPS = 0.3
+    #EPS = 0.3 #Удалите, больше не нужно
     actor.to(DEVICE)
     critic.to(DEVICE)
-
+    memory = replay_memory(10000)
     # Create test set outside the loop for consistency
     test_dataset = DataPreloading().get_train_data()  # Get the full training data
     test_indices = random.sample(range(len(test_dataset)), int(0.2 * len(test_dataset)))  # 20% for test
     test_subset = Subset(test_dataset, test_indices)
     test_dataloader = get_dataloader(test_subset, shuffle=False)
 
+    steps_done = 0
+    best_val_accuracy = float('-inf')  # Начальное значение (отрицательная бесконечность)
+    patience = 10  # Окно терпения (количество шагов без улучшений)
+    counter = 0  # Счетчик эпох без улучшений
+    best_model_state = None #Сохраняем модель с наилучшей точностью
     for episode in range(episodes):
         state = np.ones(NUM_CLASSES) / NUM_CLASSES  # Initialize state with equal distribution
         state_tensor = torch.FloatTensor(state).to(DEVICE)
         step = 0
-
         while step < max_steps:
             step += 1
+            steps_done += 1  # Увеличиваем steps_done здесь, до использования
+
             print(f"Episode: {episode+1}, Step: {step}, State: {state}")
-            epsilon = 0.1  # Epsilon-greedy action selection
+
+            epsilon = EPS_END + (EPS_START - EPS_END)*math.exp(-1*steps_done/EPS_DECAY)
+            print(f"Episode: {episode+1}, Step: {step}, Epsilon: {epsilon:.4f}")
+
             if np.random.rand() < epsilon:
                 action = np.random.dirichlet(np.ones(NUM_CLASSES))
+                action_source = "случайное"
             else:
                 with torch.no_grad():
                     action_probabilities = actor(state_tensor)
                     action = action_probabilities.cpu().numpy()
-            print(f"Episode: {episode+1}, Step: {step}, Action: {action}")
+                action_source = "агент"
+            print(f"Episode: {episode+1}, Step: {step}, Action: {action}, Действие: {action_source}") #Добавлено action_source
+
             reward, next_state = env.step(action)
             next_state_tensor = torch.FloatTensor(next_state).to(DEVICE)
 
-            value = critic(state_tensor)
-            next_value = critic(next_state_tensor)
+            reward_tensor = torch.tensor([reward], dtype=torch.float32).to(DEVICE) # Преобразуем награду в тензор
 
-            advantage = reward + (gamma * next_value) - value
-            loss_critic = advantage.pow(2).mean()
+            #Сохраняем переход в буфер
+            memory.push(state_tensor, torch.tensor(action, dtype=torch.float32).to(DEVICE), next_state_tensor, reward_tensor)
 
-            with torch.no_grad():
-                td_target = reward + gamma * critic(next_state_tensor)
-                delta = td_target - critic(state_tensor)
+            if len(memory) > 0:  # Начинаем обучение, как только в буфере что-то появится
+                batch_size = min(len(memory), BATCH_SIZE)  # Размер мини-батча зависит от заполненности буфера
+                transitions = memory.sample(batch_size)
+                batch = Transition(*zip(*transitions))
 
-            action_probabilities = actor(state_tensor)
-            log_prob = torch.log(action_probabilities)
-            loss_actor = -log_prob * delta
-            loss_actor = loss_actor.mean()
+                state_batch = torch.stack(batch.state)
+                action_batch = torch.stack(batch.action)
+                reward_batch = torch.cat(batch.reward)
+                next_state_batch = torch.stack(batch.next_state)
 
-            entropy_bonus = -torch.sum(action_probabilities * torch.log(action_probabilities + 1e-6))
-            loss_actor += 0.01 * entropy_bonus
+                #Обучаем critic
+                value = critic(state_batch)
+                next_value = critic(next_state_batch)
+                advantage = reward_batch + (gamma * next_value.squeeze()) - value.squeeze()
+                loss_critic = advantage.pow(2).mean()
 
+                #Вычисляем параметры actor
+                with torch.no_grad():
+                    td_target = reward_batch + gamma * critic(next_state_batch)
+                    delta = td_target - critic(state_batch)
+
+                action_probabilities = actor(state_batch)
+                log_prob = F.log_softmax(action_probabilities, dim=1)
+
+                # Собираем log_prob для выбранных действий
+                log_prob_actions = log_prob.gather(1, action_batch.argmax(dim=1,keepdim=True).long())#Исправлено
+
+                loss_actor = -log_prob_actions * delta.unsqueeze(1) #Исправлено
+                loss_actor = loss_actor.mean()
+
+                entropy_bonus = -torch.sum(action_probabilities * torch.log(action_probabilities + 1e-6))
+                loss_actor += 0.01 * entropy_bonus
+
+                optimizer_actor.zero_grad()
+                loss_actor.backward()
+                optimizer_actor.step()
+
+                optimizer_critic.zero_grad()
+                loss_critic.backward()
+                optimizer_critic.step()
+            env.model.train()#Необходимо переводить в train
             state = next_state
             state_tensor = next_state_tensor
-
-            optimizer_actor.zero_grad()
-            loss_actor.backward()
-            optimizer_actor.step()
-
-            optimizer_critic.zero_grad()
-            loss_critic.backward()
-            optimizer_critic.step()
-
             # Evaluate and print accuracy every 10 steps
             if step % 10 == 0:
+                env.model.eval()#Необходимо переводить в eval
                 accuracy, _ = env.evaluate(test_dataloader)
                 print(f"--------------------------------------")
                 print(f"Episode: {episode+1}, Step: {step}, Test Accuracy: {accuracy:.4f}")
                 print(f"--------------------------------------")
 
+                if accuracy > best_val_accuracy:
+                    best_val_accuracy = accuracy
+                    counter = 0  # Сбрасываем счетчик
+                    best_model_state = {
+                        'actor_state_dict': copy.deepcopy(actor.state_dict()), #Сохраняем лучшие веса
+                        'critic_state_dict': copy.deepcopy(critic.state_dict()),
+                        'actor_optimizer_state_dict': copy.deepcopy(optimizer_actor.state_dict()),
+                        'critic_optimizer_state_dict': copy.deepcopy(optimizer_critic.state_dict()),
+                        'cnn_state_dict': copy.deepcopy(env.model.state_dict()),#Сохраняем лучшие веса
+                        'steps_done': steps_done,
+                        'epsilon': epsilon
+                    }
+                    print(f"Новая лучшая точность: {best_val_accuracy:.4f}")
+                else:
+                    counter += 1  # Увеличиваем счетчик
+
+            if counter >= patience:
+                print(f"Ранняя остановка! Нет улучшений в течение {patience} шагов.")
+                # Restore best model state
+                actor.load_state_dict(best_model_state['actor_state_dict'])
+                critic.load_state_dict(best_model_state['critic_state_dict'])
+                optimizer_actor.load_state_dict(best_model_state['actor_optimizer_state_dict'])
+                optimizer_critic.load_state_dict(best_model_state['critic_optimizer_state_dict'])
+                env.model.load_state_dict(best_model_state['cnn_state_dict'])
+                steps_done = best_model_state['steps_done']
+                epsilon = best_model_state['epsilon']
+
+                break  # Выходим из цикла while
+        if best_model_state is not None:
+            print("Восстанавливаем лучшее состояние модели...")
+            actor.load_state_dict(best_model_state['actor_state_dict'])
+            critic.load_state_dict(best_model_state['critic_state_dict'])
+            optimizer_actor.load_state_dict(best_model_state['actor_optimizer_state_dict'])
+            optimizer_critic.load_state_dict(best_model_state['critic_optimizer_state_dict'])
+            env.model.load_state_dict(best_model_state['cnn_state_dict'])
+            steps_done = best_model_state['steps_done']
+            epsilon = best_model_state['epsilon']
+    env.model.eval()#Необходимо переводить в eval
     return
 if __name__ == '__main__':
     env = DataSelectionEnv()
