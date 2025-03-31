@@ -1,7 +1,6 @@
 import random
 from collections import namedtuple, deque
 import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,23 +13,22 @@ import cv2
 from PIL import Image, ImageDraw
 import os
 from sklearn.metrics import confusion_matrix
-#from tqdm import tqdm
 import copy #Импортируем библиотеку для ранней остановки
 
 BATCH_SIZE = 128
 LEARNING_RATE = 1e-3
 NUM_CLASSES = 10
 IMG_SIZE = 128
-NUM_IMAGES = 100000
-MAX_SUBSET_SIZE = 200
-CNN_EPOCHS = 2
-REWARD_SMOOTHING_WINDOW = 5
+NUM_IMAGES = 50000
+MAX_SUBSET_SIZE = 1000 #Увеличено
+CNN_EPOCHS = 1
 
-EPS_START = 0.9
-EPS_END = 0.05
-EPS_DECAY = 300
+EPS_START = 0.9#with what value of probability agent will try to guess the right action in the begining of education
+EPS_END = 0.05#the final value of probability
+EPS_DECAY = 200 #with wich speed the probability will grow
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 
 Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
 
@@ -126,23 +124,25 @@ class SimpleCNN(nn.Module):
     def __init__(self, num_classes=10):
         super().__init__()
         self.cv1 = nn.Conv2d(3, 32, kernel_size=3, padding=1)
+        self.bn1 = nn.BatchNorm2d(32)  # Batch normalization after the first conv layer
         self.cv2 = nn.Conv2d(32, 64, kernel_size=3, padding=1)
+        self.bn2 = nn.BatchNorm2d(64)  # Batch normalization after the second conv layer
         self.pool = nn.MaxPool2d(2, 2)
-        self.dropout = nn.Dropout(0.25) # Dropout
+        #self.dropout = nn.Dropout(0.25) # Dropout
         self.flatten = Flatten()
         self.fc1 = nn.Linear(64 * (IMG_SIZE//4) * (IMG_SIZE//4), 128)
+        self.bn3 = nn.BatchNorm1d(128)  # Batch normalization before the first fully connected layer
         self.fc2 = nn.Linear(128, num_classes)
         self.relu = nn.ReLU()
 
     def forward(self, x):
-        x = F.relu(self.cv1(x))
+        x = F.relu(self.bn1(self.cv1(x)))
         x = self.pool(x)
-        x = F.relu(self.cv2(x))
+        x = F.relu(self.bn2(self.cv2(x)))
         x = self.pool(x)
         x = self.flatten(x)
-        x = self.dropout(x)  # Применяем Dropout перед полносвязными слоями
-        x = x.view(x.size(0), -1)  # или reshape
-        x = F.relu(self.fc1(x))
+       # x = self.dropout(x)  # Применяем Dropout перед полносвязными слоями
+        x = F.relu(self.bn3(self.fc1(x)))
         x = self.fc2(x)
         return x
 
@@ -183,7 +183,7 @@ class DataSelectionEnv(gymnasium.Env):
         self.model = SimpleCNN().to(DEVICE) #Put the model on the available device
         self.criterion = nn.CrossEntropyLoss()
         self.indexes = self.class_select()
-        self.optim = optim.Adam(self.model.parameters(), lr=LEARNING_RATE,weight_decay=1e-5) # L2 регуляризация
+        self.optim = optim.Adam(self.model.parameters(), lr=LEARNING_RATE,weight_decay=1e-6) # L2 регуляризация
 
         # Пространство действий: вероятности выбора изображений для каждого класса
         self.action_space = gymnasium.spaces.Box(low=0, high=1, shape=(NUM_CLASSES,), dtype=np.float32)
@@ -194,9 +194,6 @@ class DataSelectionEnv(gymnasium.Env):
         self.validation_subset = Subset(self.train_data, self.validation_indices)
         self.validation_dataloader = get_dataloader(self.validation_subset, shuffle=False)
 
-        self.reward_history = []  # To store rewards for smoothing
-        self.last_acc = 0 #Для разницы между наградами
-        self.last_per_class = 0
     def class_select(self):#возвращаем словарь из индексов принадлежащим классам
         ls = {i: [] for i in range(NUM_CLASSES)} #создали пустой словарь на 10 классов
 
@@ -219,24 +216,23 @@ class DataSelectionEnv(gymnasium.Env):
 
         return Subset(self.train_data, index)#состовляем subset
 
-    def step(self, action):
+    def step(self, action,weights):
         # в этой функции мы создаем выборку на основе action и проверяем, насколько улучшилось или ухудшилось предсказание сети
-        action = np.clip(action + np.random.uniform(-0.05, 0.05, size=action.shape), 0, 1)
+        #action = np.clip(action + np.random.uniform(-0.05, 0.05, size=action.shape), 0, 1)
         train_subset = self.sample(action) #subset - выбранное случайное подмножество из 32 элементов на основе распределения action
         #test_subset = self.sample(action) #subset - выбранное случайное подмножество из 32 элементов на основе распределения action
         #Create test set - fixed
         train_dataloader = get_dataloader(train_subset) #создали dataloader, выдающий этот batch из 32 элементов
         #prev_acc, _ = self.evaluate(test_dataloader) #вычиляем текущую точность модели на тестовой выборке
         self.train_model(train_dataloader, epochs=CNN_EPOCHS) #тренируем модель на тренировчной выборке
-        new_acc, accuracy_per_class = self.evaluate(self.validation_dataloader)  # Теперь возвращается точность по классам
-        class_weights = [1,1,1,1,1,1,1,1,1,1] #Пример
-        reward = np.sum([class_weights[i] * accuracy_per_class[i] for i in range(NUM_CLASSES)])-self.last_per_class
-        self.last_per_class = np.sum([class_weights[i] * accuracy_per_class[i] for i in range(NUM_CLASSES)]) #Вычитаем предыдущие значения
+        _, err_per_cl = self.evaluate(self.validation_dataloader)  # Теперь возвращается точность по классам
+        
+        reward = np.sum([(1- err_per_cl[i])*weights[i] for i in range(NUM_CLASSES)])
         #reward = new_acc - self.last_acc #Предыдущая награда
 
-        return reward, accuracy_per_class
+        return reward, err_per_cl
 
-    def train_model(self, dataloader, epochs=5): #multiple epochs
+    def train_model(self, dataloader, epochs=1): #multiple epochs
         # на вход приходит dataloader выдающий batch изображений и ответов к ним
         self.model.train()#Необходимо переводить в train
         for epoch in range(epochs):
@@ -245,38 +241,44 @@ class DataSelectionEnv(gymnasium.Env):
                 self.optim.zero_grad() #обновили optimizer
                 output = self.model(images) #получили тензор(batch_size, NUM_CLASSES) с распределением вероятностей для каждого изображения
                 #print(output)
-                loss = self.criterion(output, labels) #вычислили ошибку с помощью CrossEntropyLoss
+                loss = self.criterion(output, labels) #вычислили ошибку с помощью CrossEntropyLoss\
+                print("loss = ", loss)
                 loss.backward()
                 self.optim.step()
 
-    def evaluate(self,dataloader):#тестирование модели
-        self.model.eval()#перевели модель в оценочный режим
+
+
+    def evaluate(self, dataloader):
+        self.model.eval()  # Переводим модель в оценочный режим
         correct = 0
         total = 0
-        ls = [0]*NUM_CLASSES
-        ers = [0]*NUM_CLASSES
+        ls = torch.zeros(NUM_CLASSES, dtype=torch.int64, device=DEVICE)
+        ers = torch.zeros(NUM_CLASSES, dtype=torch.int64, device=DEVICE)
+
         with torch.no_grad():
-            #batchiter = iter(dataloader) #получили из dataloader batch на batch_size изображений
             for images, labels in dataloader:
                 images, labels = images.to(DEVICE), labels.to(DEVICE)
-                output = self.model(images) #получили тензор(batch_size,NUM_CLASSES) с распределениями вероятсностей для каждого изображения
-                predicted = torch.argmax(output,dim=1) #получили тезор(batch_size) с предложенными значениями классов
-                correct += (predicted==labels).sum().item() #нашли количество правильных ответов
-                total += labels.size(0) #calculate all samples
+                output = self.model(images)  # Получили тензор(batch_size,NUM_CLASSES)
+                predicted = torch.argmax(output, dim=1)  # Получили тезор(batch_size)
+                correct += (predicted == labels).sum().item()  # Нашли количество правильных ответов
+                total += labels.size(0)  # Calculate all samples
 
-                for i in range(len(labels)):
-                    label = labels[i].item()
-                    if predicted[i]==labels[i]:
-                        ls[label]+=1
-                    else:
-                        ers[label]+=1
-                        ls[label]+=1
-            #print(ers,ls)
-            error_per_class = [ers[i]/ls[i] if ls[i] > 0 else 0 for i in range(NUM_CLASSES)] #handle the zero division
-            accuracy_per_class = [1 - err for err in error_per_class] #Вычисляем точность
-        accuracy = (correct / total) if total > 0 else 0 # находим точность на данной выборке
+                # Обновляем ls и ers с использованием масок
+                for i in range(NUM_CLASSES):
+                    ls[i] += (labels == i).sum()
+                    ers[i] += ((labels == i) & (predicted != labels)).sum()
+
+        # Вычисляем error_per_class, обрабатывая деление на ноль
+        error_per_class = [(ers[i].float() / ls[i].float()).item() if ls[i] > 0 else 0 for i in range(NUM_CLASSES)]
+
+        accuracy = (correct / total) if total > 0 else 0  # Находим точность на данной выборке
         print("accuracy = ", accuracy)
-        return accuracy, accuracy_per_class
+        return accuracy, error_per_class
+    
+def calculate_class_values(error_per_class):
+    """Вычисляет ценность классов на основе ошибок."""
+    class_values = [min(1.0 / (1 - error + 1e-6), 10) for error in error_per_class]  # Избегаем деления на 0
+    return class_values
 
 class Actor(nn.Module):
     def __init__(self, input_size, num_actions):
@@ -298,6 +300,15 @@ class Critic(nn.Module):
     def forward(self, x):
         x = F.relu(self.fc1(x))
         return self.fc2(x)
+    
+import torch.profiler as profiler
+prof = profiler.profile(
+    schedule=profiler.schedule(wait=1, warmup=1, active=3, repeat=2),
+    on_trace_ready=torch.profiler.tensorboard_trace_handler('./log'),
+    record_shapes=True,
+    profile_memory=True,
+    with_stack=True
+)
 
 def actor_critic(env, actor, critic, episodes=10, max_steps=100, gamma=0.99, lr_actor=1e-3, lr_critic=1e-3):
     optimizer_actor = optim.AdamW(actor.parameters(), lr=lr_actor)
@@ -310,114 +321,129 @@ def actor_critic(env, actor, critic, episodes=10, max_steps=100, gamma=0.99, lr_
     test_dataset = DataPreloading().get_train_data()  # Get the full training data
     test_indices = random.sample(range(len(test_dataset)), int(0.2 * len(test_dataset)))  # 20% for test
     test_subset = Subset(test_dataset, test_indices)
+    train_dataloader = get_dataloader(test_dataset, shuffle=False)
     test_dataloader = get_dataloader(test_subset, shuffle=False)
-
+    
     steps_done = 0
     best_val_accuracy = float('-inf')  # Начальное значение (отрицательная бесконечность)
-    patience = 10  # Окно терпения (количество шагов без улучшений)
+    patience = 30  # Окно терпения (количество эпох без улучшений)
     counter = 0  # Счетчик эпох без улучшений
     best_model_state = None #Сохраняем модель с наилучшей точностью
-    for episode in range(episodes):
-        state = np.ones(NUM_CLASSES) / NUM_CLASSES  # Initialize state with equal distribution
-        state_tensor = torch.FloatTensor(state).to(DEVICE)
-        step = 0
-        while step < max_steps:
-            step += 1
-            steps_done += 1  # Увеличиваем steps_done здесь, до использования
+    with prof:
+        for episode in range(episodes):
+            state = np.ones(NUM_CLASSES) / NUM_CLASSES  # Initialize state with equal distribution
+            state_tensor = torch.FloatTensor(state).to(DEVICE)
+            step = 0
+            while step < max_steps:
+                step += 1
+                steps_done += 1  # Увеличиваем steps_done здесь, до использования
 
-            print(f"Episode: {episode+1}, Step: {step}, State: {state}")
+                print(f"Episode: {episode+1}, Step: {step}, State: {state}")
+                weights = calculate_class_values(state)
+                print("weights", weights)
+                epsilon = EPS_END + (EPS_START - EPS_END)*math.exp(-1*steps_done/EPS_DECAY)
+                print(f"Episode: {episode+1}, Step: {step}, Epsilon: {epsilon:.4f}")
 
-            epsilon = EPS_END + (EPS_START - EPS_END)*math.exp(-1*steps_done/EPS_DECAY)
-            print(f"Episode: {episode+1}, Step: {step}, Epsilon: {epsilon:.4f}")
-
-            if np.random.rand() < epsilon:
-                action = np.random.dirichlet(np.ones(NUM_CLASSES))
-                action_source = "случайное"
-            else:
-                with torch.no_grad():
-                    action_probabilities = actor(state_tensor)
-                    action = action_probabilities.cpu().numpy()
-                action_source = "агент"
-            print(f"Episode: {episode+1}, Step: {step}, Action: {action}, Действие: {action_source}") #Добавлено action_source
-
-            reward, next_state = env.step(action)
-            next_state_tensor = torch.FloatTensor(next_state).to(DEVICE)
-
-            reward_tensor = torch.tensor([reward], dtype=torch.float32).to(DEVICE) # Преобразуем награду в тензор
-
-            #Сохраняем переход в буфер
-            memory.push(state_tensor, torch.tensor(action, dtype=torch.float32).to(DEVICE), next_state_tensor, reward_tensor)
-
-            if len(memory) > 0:  # Начинаем обучение, как только в буфере что-то появится
-                batch_size = min(len(memory), BATCH_SIZE)  # Размер мини-батча зависит от заполненности буфера
-                transitions = memory.sample(batch_size)
-                batch = Transition(*zip(*transitions))
-
-                state_batch = torch.stack(batch.state)
-                action_batch = torch.stack(batch.action)
-                reward_batch = torch.cat(batch.reward)
-                next_state_batch = torch.stack(batch.next_state)
-
-                #Обучаем critic
-                value = critic(state_batch)
-                next_value = critic(next_state_batch)
-                advantage = reward_batch + (gamma * next_value.squeeze()) - value.squeeze()
-                loss_critic = advantage.pow(2).mean()
-
-                #Вычисляем параметры actor
-                with torch.no_grad():
-                    td_target = reward_batch + gamma * critic(next_state_batch)
-                    delta = td_target - critic(state_batch)
-
-                action_probabilities = actor(state_batch)
-                log_prob = F.log_softmax(action_probabilities, dim=1)
-
-                # Собираем log_prob для выбранных действий
-                log_prob_actions = log_prob.gather(1, action_batch.argmax(dim=1,keepdim=True).long())#Исправлено
-
-                loss_actor = -log_prob_actions * delta.unsqueeze(1) #Исправлено
-                loss_actor = loss_actor.mean()
-
-                entropy_bonus = -torch.sum(action_probabilities * torch.log(action_probabilities + 1e-6))
-                loss_actor += 0.01 * entropy_bonus
-
-                optimizer_actor.zero_grad()
-                loss_actor.backward()
-                optimizer_actor.step()
-
-                optimizer_critic.zero_grad()
-                loss_critic.backward()
-                optimizer_critic.step()
-            env.model.train()#Необходимо переводить в train
-            state = next_state
-            state_tensor = next_state_tensor
-            # Evaluate and print accuracy every 10 steps
-            if step % 10 == 0:
-                env.model.eval()#Необходимо переводить в eval
-                accuracy, _ = env.evaluate(test_dataloader)
-                print(f"--------------------------------------")
-                print(f"Episode: {episode+1}, Step: {step}, Test Accuracy: {accuracy:.4f}")
-                print(f"--------------------------------------")
-
-                if accuracy > best_val_accuracy:
-                    best_val_accuracy = accuracy
-                    counter = 0  # Сбрасываем счетчик
-                    best_model_state = {
-                        'actor_state_dict': copy.deepcopy(actor.state_dict()), #Сохраняем лучшие веса
-                        'critic_state_dict': copy.deepcopy(critic.state_dict()),
-                        'actor_optimizer_state_dict': copy.deepcopy(optimizer_actor.state_dict()),
-                        'critic_optimizer_state_dict': copy.deepcopy(optimizer_critic.state_dict()),
-                        'cnn_state_dict': copy.deepcopy(env.model.state_dict()),#Сохраняем лучшие веса
-                        'steps_done': steps_done,
-                        'epsilon': epsilon
-                    }
-                    print(f"Новая лучшая точность: {best_val_accuracy:.4f}")
+                if np.random.rand() < epsilon:
+                    action = np.random.dirichlet(np.ones(NUM_CLASSES))
+                    action_source = "случайное"
+                    action_tensor = torch.tensor(action, dtype=torch.float32).to(DEVICE)
+                    action_probabilities = torch.tensor(action, dtype=torch.float32).to(DEVICE)
                 else:
-                    counter += 1  # Увеличиваем счетчик
+                    with torch.no_grad():
+                        action_probabilities = actor(state_tensor)
+                        action = action_probabilities.cpu().numpy()
+                        action_tensor = torch.tensor(action, dtype=torch.float32).to(DEVICE)
 
-            if counter >= patience:
-                print(f"Ранняя остановка! Нет улучшений в течение {patience} шагов.")
-                # Restore best model state
+                    action_source = "агент"
+                print(f"Episode: {episode+1}, Step: {step}, Action: {action}, Действие: {action_source}")
+
+                reward, next_state = env.step(action,weights)
+                next_state_tensor = torch.FloatTensor(next_state).to(DEVICE)
+                reward_tensor = torch.tensor([reward], dtype=torch.float32).to(DEVICE) # Преобразуем награду в тензор
+
+                #Сохраняем переход в буфер
+                memory.push(state_tensor, action_tensor, next_state_tensor, reward_tensor)
+
+                if len(memory) > 0:  # Начинаем обучение, как только в буфере что-то появится
+                    batch_size = min(len(memory), BATCH_SIZE)  # Размер мини-батча зависит от заполненности буфера
+                    transitions = memory.sample(batch_size)
+                    batch = Transition(*zip(*transitions))
+
+                    state_batch = torch.stack(batch.state)
+                    action_batch = torch.stack(batch.action)
+                    reward_batch = torch.cat(batch.reward)
+                    next_state_batch = torch.stack(batch.next_state)
+                    
+                    #Обучаем critic - своя копия
+                    value_critic = critic(state_batch)
+                    next_value_critic = critic(next_state_batch)
+                    advantage_critic = reward_batch + (gamma * next_value_critic.squeeze()) - value_critic.squeeze()
+                    loss_critic = advantage_critic.pow(2).mean()
+                    optimizer_critic.zero_grad()
+                    loss_critic.backward()
+                    optimizer_critic.step()
+
+                    #Обучаем actor - своя копия
+                    value_actor = critic(state_batch)
+                    next_value_actor = critic(next_state_batch)
+                    advantage_actor = reward_batch + (gamma * next_value_actor.squeeze()) - value_actor.squeeze()
+
+                    log_prob = F.log_softmax(action_probabilities, dim=1)
+                    # Собираем log_prob для выбранных действий
+                    log_prob_actions = log_prob.gather(1, action_batch.argmax(dim=1,keepdim=True).long())#Исправлено
+
+                    loss_actor = -log_prob_actions * advantage_actor.unsqueeze(1) #Исправлено
+                    loss_actor = loss_actor.mean()
+
+                    entropy_bonus = -torch.sum(action_probabilities * torch.log(action_probabilities + 1e-6))
+                    loss_actor += 0.01 * entropy_bonus
+                    optimizer_actor.zero_grad()
+                    loss_actor.backward()
+                    optimizer_actor.step()
+                env.model.train()#Необходимо переводить в train
+                state = next_state
+                state_tensor = next_state_tensor
+                # Evaluate and print accuracy every 10 steps
+                if step % 10 == 0:
+                    env.model.eval()#Необходимо переводить в eval
+                    accuracy, _ = env.evaluate(test_dataloader)
+                    train_accuracy, _ =  env.evaluate(train_dataloader)
+                    print(f"--------------------------------------")
+                    print(f"Episode: {episode+1}, Step: {step}, Test Accuracy: {accuracy:.4f}")
+                    print(f"Episode: {episode+1}, Step: {step}, Train Accuracy: {train_accuracy:.4f}")
+                    print(f"--------------------------------------")
+
+                    if accuracy > best_val_accuracy:
+                        best_val_accuracy = accuracy
+                        counter = 0  # Сбрасываем счетчик
+                        best_model_state = {
+                            'actor_state_dict': copy.deepcopy(actor.state_dict()), #Сохраняем лучшие веса
+                            'critic_state_dict': copy.deepcopy(critic.state_dict()),
+                            'actor_optimizer_state_dict': copy.deepcopy(optimizer_actor.state_dict()),
+                            'critic_optimizer_state_dict': copy.deepcopy(optimizer_critic.state_dict()),
+                            'cnn_state_dict': copy.deepcopy(env.model.state_dict()),#Сохраняем лучшие веса
+                            'steps_done': steps_done,
+                            'epsilon': epsilon
+                        }
+                        print(f"Новая лучшая точность: {best_val_accuracy:.4f}")
+                    else:
+                        counter += 1  # Увеличиваем счетчик
+
+                if counter >= patience:
+                    print(f"Ранняя остановка! Разница между точностью на тренировочном и валидационном наборах превысила 0.3 и нет улучшений в течение {patience} шагов.")
+                    # Restore best model state
+                    actor.load_state_dict(best_model_state['actor_state_dict'])
+                    critic.load_state_dict(best_model_state['critic_state_dict'])
+                    optimizer_actor.load_state_dict(best_model_state['actor_optimizer_state_dict'])
+                    optimizer_critic.load_state_dict(best_model_state['critic_optimizer_state_dict'])
+                    env.model.load_state_dict(best_model_state['cnn_state_dict'])
+                    steps_done = best_model_state['steps_done']
+                    epsilon = best_model_state['epsilon']
+
+                    break  # Выходим из цикла while
+            if best_model_state is not None:
+                print("Восстанавливаем лучшее состояние модели...")
                 actor.load_state_dict(best_model_state['actor_state_dict'])
                 critic.load_state_dict(best_model_state['critic_state_dict'])
                 optimizer_actor.load_state_dict(best_model_state['actor_optimizer_state_dict'])
@@ -425,19 +451,9 @@ def actor_critic(env, actor, critic, episodes=10, max_steps=100, gamma=0.99, lr_
                 env.model.load_state_dict(best_model_state['cnn_state_dict'])
                 steps_done = best_model_state['steps_done']
                 epsilon = best_model_state['epsilon']
-
-                break  # Выходим из цикла while
-        if best_model_state is not None:
-            print("Восстанавливаем лучшее состояние модели...")
-            actor.load_state_dict(best_model_state['actor_state_dict'])
-            critic.load_state_dict(best_model_state['critic_state_dict'])
-            optimizer_actor.load_state_dict(best_model_state['actor_optimizer_state_dict'])
-            optimizer_critic.load_state_dict(best_model_state['critic_optimizer_state_dict'])
-            env.model.load_state_dict(best_model_state['cnn_state_dict'])
-            steps_done = best_model_state['steps_done']
-            epsilon = best_model_state['epsilon']
     env.model.eval()#Необходимо переводить в eval
     return
+
 if __name__ == '__main__':
     env = DataSelectionEnv()
     actor = Actor(NUM_CLASSES, NUM_CLASSES)
